@@ -1984,7 +1984,7 @@ function TopBar({ user, onLogout, processedPackages, onDownload, onShare }) {
 }
 
 /* ─────────────────────────── MAIN APP ─────────────────────────── */
-export default function App() {
+export default function MediSort_AI() {
   const [screen, setScreen] = useState("login");
   const [user, setUser] = useState(null);
   const [file, setFile] = useState(null);
@@ -2217,4 +2217,3 @@ Rules:
   );
 }
 
-export default MediSort_AI;
