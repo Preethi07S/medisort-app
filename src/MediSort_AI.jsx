@@ -515,17 +515,29 @@ function LoginScreen({ onLogin }) {
 
         googleBtnRef.current.innerHTML = "";
 
-        window.google.accounts.id.renderButton(
-          googleBtnRef.current,
-          {
-            theme: "filled_blue",
-            size: "large",
-            shape: "rectangular",
-            text: "signin_with",
-            width: 340,
-            logo_alignment: "left",
-          }
-        );
+        setTimeout(() => {
+
+  if (
+    googleBtnRef.current &&
+    window.google?.accounts?.id
+  ) {
+
+    googleBtnRef.current.innerHTML = "";
+
+    window.google.accounts.id.renderButton(
+      googleBtnRef.current,
+      {
+        theme: "filled_blue",
+        size: "large",
+        shape: "rectangular",
+        text: "signin_with",
+        width: 340,
+        logo_alignment: "left",
+      }
+    );
+  }
+
+}, 300);
       }
 
     } catch (err) {
