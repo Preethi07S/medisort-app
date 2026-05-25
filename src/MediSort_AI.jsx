@@ -407,7 +407,7 @@ function LoginScreen({ onLogin }) {
 
   // ✅ PUT YOUR GOOGLE CLIENT ID HERE
   const clientId = 
-    "652910726285-mda18dsfu233n4g5hp7gp9m16jer2sva.apps.googleusercontent.com";
+      import.meta.env.VITE_GOOGLE_CLIENT_ID;
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
