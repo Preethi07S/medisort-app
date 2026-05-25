@@ -2217,3 +2217,4 @@ Rules:
   );
 }
 
+export default MediSort_AI;
