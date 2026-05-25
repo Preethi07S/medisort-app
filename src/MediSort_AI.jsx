@@ -414,7 +414,7 @@ function LoginScreen({ onLogin }) {
 
   const googleBtnRef = useRef(null);
   const gisLoaded = useRef(false);
-
+  const buttonRendered = useRef(false);
   /* ─────────────────────────────────────────────
      Decode Google JWT Payload
   ───────────────────────────────────────────── */
@@ -511,34 +511,25 @@ function LoginScreen({ onLogin }) {
       });
 
       // Render Google Button
-      if (googleBtnRef.current) {
+      if (
+  googleBtnRef.current &&
+  !buttonRendered.current
+) {
 
-        googleBtnRef.current.innerHTML = "";
+  buttonRendered.current = true;
 
-        setTimeout(() => {
-
-  if (
-    googleBtnRef.current &&
-    window.google?.accounts?.id
-  ) {
-
-    googleBtnRef.current.innerHTML = "";
-
-    window.google.accounts.id.renderButton(
-      googleBtnRef.current,
-      {
-        theme: "filled_blue",
-        size: "large",
-        shape: "rectangular",
-        text: "signin_with",
-        width: 340,
-        logo_alignment: "left",
-      }
-    );
-  }
-
-}, 300);
-      }
+  window.google.accounts.id.renderButton(
+    googleBtnRef.current,
+    {
+      theme: "filled_blue",
+      size: "large",
+      shape: "rectangular",
+      text: "signin_with",
+      width: 340,
+      logo_alignment: "left",
+    }
+  );
+}
 
     } catch (err) {
 
@@ -603,10 +594,11 @@ function LoginScreen({ onLogin }) {
   ───────────────────────────────────────────── */
   useEffect(() => {
 
+  if (!buttonRendered.current) {
     initGoogle();
+  }
 
-  }, []);
-
+}, []);
   /* ─────────────────────────────────────────────
      UI
   ───────────────────────────────────────────── */
