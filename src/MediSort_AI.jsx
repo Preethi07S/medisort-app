@@ -30,7 +30,7 @@ const GEMINI_API_URL =
  * @param {number} maxTokens     - Max output tokens (default 4096)
  * @returns {Promise<string>}    - Model reply as plain text
  */
-async function callGemini(messages, systemPrompt = "", maxTokens = 4096) {
+async function callGemini(messages, systemPrompt = "", maxTokens = 4096, extraConfig = {}) {
   const body = {
     // Gemini separates system instructions from conversation contents
     ...(systemPrompt && {
@@ -43,6 +43,8 @@ async function callGemini(messages, systemPrompt = "", maxTokens = 4096) {
     })),
     generationConfig: {
       maxOutputTokens: maxTokens,
+      // temperature:0 is set per-call via the optional 4th argument
+      ...(typeof extraConfig === "object" ? extraConfig : {}),
     },
   };
 
@@ -2111,7 +2113,6 @@ function TopBar({ user, onLogout, processedPackages, onDownload, onShare }) {
         <span style={{ fontWeight:700, fontSize:16, letterSpacing:"-0.025em" }}>
           MediSort <span style={{ color:"#00D4B4" }}>AI</span>
         </span>
-        <span className="badge badge-teal" style={{ fontSize:10 }}>BETA</span>
       </div>
 
       <div style={{ display:"flex", alignItems:"center", gap:10 }}>
@@ -2186,34 +2187,305 @@ export default function MediSort_AI() {
   const updateStep = (idx, status, message) =>
     setSteps(prev => prev.map((s, i) => i === idx ? { ...s, status, message } : s));
 
-  /* ─────────────────────────────────────────────────────────────────────────
-     ruleBasedClassify — deterministic fallback used when the AI either
-     fails outright or collapses all tests into a single bucket.
-     Keyword rules mirror the TAXONOMY in the AI prompt so the two stay
-     in sync. Order matters: more-specific patterns are checked first.
-  ───────────────────────────────────────────────────────────────────────── */
+  /* ═══════════════════════════════════════════════════════════════════════════
+     CANONICAL CATEGORY ORDER
+     Defines the exact display / output order.  "Other Tests" is always last.
+     Any AI-returned category name is normalised against this list (case-
+     insensitive) so typos from the model never produce stray headings.
+  ═══════════════════════════════════════════════════════════════════════════ */
+  const CATEGORY_ORDER = [
+    "Urine Routine Analysis",
+    "Lipid Profile",
+    "Diabetes Profile",
+    "Kidney Function Tests",
+    "Thyroid Profile",
+    "Liver Function Tests",
+    "Complete Blood Count (CBC)",
+    "Iron Studies",
+    "Vitamins",
+    "Electrolytes & Minerals",
+    "Cardiac Risk Markers",
+    "Hormones",
+    "Infectious Disease / Serology",
+    "Coagulation Profile",
+    "Other Tests",   // ← always last
+  ];
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     CANONICAL TEST → CATEGORY LOOKUP TABLE
+     Hard-coded mappings for the most common / ambiguous test names.
+     Keys are lower-cased trimmed test names; values are exact category names.
+     This table is used in two ways:
+       1. Injected into the AI prompt as a "cheat-sheet" for disambiguation.
+       2. Used by ruleBasedClassify as a primary lookup before regex fallback.
+  ═══════════════════════════════════════════════════════════════════════════ */
+  const TEST_LOOKUP = {
+    // ── Urine Routine Analysis ──────────────────────────────────────────────
+    "urine nitrates":                          "Urine Routine Analysis",
+    "urine specific gravity":                  "Urine Routine Analysis",
+    "urine appearance":                        "Urine Routine Analysis",
+    "urine epithelial cells":                  "Urine Routine Analysis",
+    "urine colour":                            "Urine Routine Analysis",
+    "urine color":                             "Urine Routine Analysis",
+    "urine casts":                             "Urine Routine Analysis",
+    "urine blood":                             "Urine Routine Analysis",
+    "urine rbc":                               "Urine Routine Analysis",
+    "urine bilirubin":                         "Urine Routine Analysis",
+    "urine glucose":                           "Urine Routine Analysis",
+    "urine ketones":                           "Urine Routine Analysis",
+    "urine protein":                           "Urine Routine Analysis",
+    "urine pus cells":                         "Urine Routine Analysis",
+    "urine crystals (crystalluria)":           "Urine Routine Analysis",
+    "urobilinogen":                            "Urine Routine Analysis",
+    "urine ph":                                "Urine Routine Analysis",
+    "urine amorphous deposits":                "Urine Routine Analysis",
+    "microalbumin":                            "Urine Routine Analysis",
+    "urine potassium":                         "Urine Routine Analysis",
+    "urine albumin to creatinine ratio (acr)": "Urine Routine Analysis",
+    "urine acr":                               "Urine Routine Analysis",
+    "urine microalbumin":                      "Urine Routine Analysis",
+    "urine creatinine":                        "Urine Routine Analysis",
+    "urine sodium":                            "Urine Routine Analysis",
+    "urine calcium":                           "Urine Routine Analysis",
+    "urine phosphorus":                        "Urine Routine Analysis",
+    "urine uric acid":                         "Urine Routine Analysis",
+    "24 hour urine protein":                   "Urine Routine Analysis",
+    "spot urine protein":                      "Urine Routine Analysis",
+    // ── Lipid Profile ───────────────────────────────────────────────────────
+    "high density lipoprotein (hdl)":          "Lipid Profile",
+    "hdl":                                     "Lipid Profile",
+    "total cholesterol : hdl ratio":           "Lipid Profile",
+    "serum total cholesterol":                 "Lipid Profile",
+    "total cholesterol":                       "Lipid Profile",
+    "triglycerides":                           "Lipid Profile",
+    "low density lipoprotein (ldl)":           "Lipid Profile",
+    "ldl":                                     "Lipid Profile",
+    "very low density lipoprotein (vldl)":     "Lipid Profile",
+    "vldl":                                    "Lipid Profile",
+    "hdl : ldl ratio test":                    "Lipid Profile",
+    "hdl/ldl ratio":                           "Lipid Profile",
+    "apolipoproteins a1+b":                    "Lipid Profile",
+    "apolipoprotein a1":                       "Lipid Profile",
+    "apolipoprotein b":                        "Lipid Profile",
+    "non-hdl cholesterol":                     "Lipid Profile",
+    "lipoprotein (a)":                         "Lipid Profile",
+    "lp(a)":                                   "Lipid Profile",
+    // ── Diabetes Profile ────────────────────────────────────────────────────
+    "fasting blood sugar (fbs)":               "Diabetes Profile",
+    "fasting blood sugar":                     "Diabetes Profile",
+    "fbs":                                     "Diabetes Profile",
+    "hba1c (glycated hemoglobin)":             "Diabetes Profile",
+    "hba1c":                                   "Diabetes Profile",
+    "glycated hemoglobin":                     "Diabetes Profile",
+    "glycated haemoglobin":                    "Diabetes Profile",
+    "food tolerance test (vegeterian/non-vegeterian)": "Diabetes Profile",
+    "food tolerance test":                     "Diabetes Profile",
+    "post prandial blood sugar (ppbs)":        "Diabetes Profile",
+    "ppbs":                                    "Diabetes Profile",
+    "random blood sugar":                      "Diabetes Profile",
+    "rbs":                                     "Diabetes Profile",
+    "glucose tolerance test (gtt)":            "Diabetes Profile",
+    "insulin fasting":                         "Diabetes Profile",
+    "c-peptide":                               "Diabetes Profile",
+    // ── Kidney Function Tests ───────────────────────────────────────────────
+    "creatinine, blood test":                  "Kidney Function Tests",
+    "creatinine":                              "Kidney Function Tests",
+    "serum creatinine":                        "Kidney Function Tests",
+    "uric acid, serum":                        "Kidney Function Tests",
+    "uric acid":                               "Kidney Function Tests",
+    "serum uric acid":                         "Kidney Function Tests",
+    "bun (blood urea nitrogen)":               "Kidney Function Tests",
+    "bun":                                     "Kidney Function Tests",
+    "blood urea nitrogen":                     "Kidney Function Tests",
+    "blood urea":                              "Kidney Function Tests",
+    "bun/creatnine ratio":                     "Kidney Function Tests",
+    "bun/creatinine ratio":                    "Kidney Function Tests",
+    "egfr":                                    "Kidney Function Tests",
+    "estimated gfr":                           "Kidney Function Tests",
+    "cystatin c":                              "Kidney Function Tests",
+    // ── Thyroid Profile ─────────────────────────────────────────────────────
+    "thyroid stimulating harmone (tsh)":       "Thyroid Profile",
+    "thyroid stimulating hormone (tsh)":       "Thyroid Profile",
+    "tsh":                                     "Thyroid Profile",
+    "triiodothyronine (t3)":                   "Thyroid Profile",
+    "t3":                                      "Thyroid Profile",
+    "free t3":                                 "Thyroid Profile",
+    "ft3":                                     "Thyroid Profile",
+    "thyroxine (t4)":                          "Thyroid Profile",
+    "t4":                                      "Thyroid Profile",
+    "free t4":                                 "Thyroid Profile",
+    "ft4":                                     "Thyroid Profile",
+    "anti-tpo antibodies":                     "Thyroid Profile",
+    "anti-thyroglobulin antibodies":           "Thyroid Profile",
+    // ── Liver Function Tests ────────────────────────────────────────────────
+    "serum bilirubin total":                   "Liver Function Tests",
+    "bilirubin total":                         "Liver Function Tests",
+    "bilirubin direct":                        "Liver Function Tests",
+    "bilirubin indirect":                      "Liver Function Tests",
+    "sgpt (alt)":                              "Liver Function Tests",
+    "sgot (ast)":                              "Liver Function Tests",
+    "sgpt":                                    "Liver Function Tests",
+    "sgot":                                    "Liver Function Tests",
+    "alt":                                     "Liver Function Tests",
+    "ast":                                     "Liver Function Tests",
+    "alp":                                     "Liver Function Tests",
+    "alkaline phosphatase":                    "Liver Function Tests",
+    "ggt":                                     "Liver Function Tests",
+    "gamma gt":                                "Liver Function Tests",
+    "total protein":                           "Liver Function Tests",
+    "serum albumin":                           "Liver Function Tests",
+    "albumin, serum":                          "Liver Function Tests",
+    "globulin":                                "Liver Function Tests",
+    "a/g ratio":                               "Liver Function Tests",
+    // ── Complete Blood Count (CBC) ──────────────────────────────────────────
+    "haemoglobin":                             "Complete Blood Count (CBC)",
+    "hemoglobin":                              "Complete Blood Count (CBC)",
+    "rbc count":                               "Complete Blood Count (CBC)",
+    "total wbc count":                         "Complete Blood Count (CBC)",
+    "platelet count":                          "Complete Blood Count (CBC)",
+    "hct":                                     "Complete Blood Count (CBC)",
+    "hematocrit":                              "Complete Blood Count (CBC)",
+    "haematocrit":                             "Complete Blood Count (CBC)",
+    "mcv":                                     "Complete Blood Count (CBC)",
+    "mch":                                     "Complete Blood Count (CBC)",
+    "mchc":                                    "Complete Blood Count (CBC)",
+    "red cell distribution width (rdw-cv)":    "Complete Blood Count (CBC)",
+    "rdw-cv":                                  "Complete Blood Count (CBC)",
+    "rdw":                                     "Complete Blood Count (CBC)",
+    "red cell distribution width - sd(rdw-sd)":"Complete Blood Count (CBC)",
+    "rdw-sd":                                  "Complete Blood Count (CBC)",
+    "platelet to large cell ratio (p-lcr)":    "Complete Blood Count (CBC)",
+    "p-lcr":                                   "Complete Blood Count (CBC)",
+    "platelet distribution width (pdw)":       "Complete Blood Count (CBC)",
+    "pdw":                                     "Complete Blood Count (CBC)",
+    "nucleated red blood cells":               "Complete Blood Count (CBC)",
+    "nrbc":                                    "Complete Blood Count (CBC)",
+    "neutrophils":                             "Complete Blood Count (CBC)",
+    "lymphocytes":                             "Complete Blood Count (CBC)",
+    "monocytes":                               "Complete Blood Count (CBC)",
+    "eosinophils":                             "Complete Blood Count (CBC)",
+    "basophils":                               "Complete Blood Count (CBC)",
+    "differential count":                      "Complete Blood Count (CBC)",
+    "mpv":                                     "Complete Blood Count (CBC)",
+    // ── Iron Studies ────────────────────────────────────────────────────────
+    "iron test, serum":                        "Iron Studies",
+    "serum iron":                              "Iron Studies",
+    "total iron binding capacity (tibc)":      "Iron Studies",
+    "tibc":                                    "Iron Studies",
+    "transferrin saturation":                  "Iron Studies",
+    "ferritin":                                "Iron Studies",
+    "serum ferritin":                          "Iron Studies",
+    // ── Vitamins ────────────────────────────────────────────────────────────
+    "vitamin d, total-25 hydroxy":             "Vitamins",
+    "vitamin d":                               "Vitamins",
+    "25-oh vitamin d":                         "Vitamins",
+    "vitamin b12":                             "Vitamins",
+    "cyanocobalamin":                          "Vitamins",
+    "folate":                                  "Vitamins",
+    "folic acid":                              "Vitamins",
+    "vitamin c":                               "Vitamins",
+    "vitamin a":                               "Vitamins",
+    "vitamin e":                               "Vitamins",
+    "vitamin k":                               "Vitamins",
+    // ── Electrolytes & Minerals ─────────────────────────────────────────────
+    "calcium, serum":                          "Electrolytes & Minerals",
+    "serum calcium":                           "Electrolytes & Minerals",
+    "calcium":                                 "Electrolytes & Minerals",
+    "sodium":                                  "Electrolytes & Minerals",
+    "serum sodium":                            "Electrolytes & Minerals",
+    "potassium, serum":                        "Electrolytes & Minerals",
+    "serum potassium":                         "Electrolytes & Minerals",
+    "chloride":                                "Electrolytes & Minerals",
+    "serum chloride":                          "Electrolytes & Minerals",
+    "magnesium":                               "Electrolytes & Minerals",
+    "serum magnesium":                         "Electrolytes & Minerals",
+    "phosphorus":                              "Electrolytes & Minerals",
+    "inorganic phosphorus":                    "Electrolytes & Minerals",
+    "bicarbonate":                             "Electrolytes & Minerals",
+    // ── Cardiac Risk Markers ────────────────────────────────────────────────
+    "hs-crp":                                  "Cardiac Risk Markers",
+    "high sensitivity crp":                    "Cardiac Risk Markers",
+    "crp":                                     "Cardiac Risk Markers",
+    "homocysteine":                            "Cardiac Risk Markers",
+    "troponin i":                              "Cardiac Risk Markers",
+    "troponin t":                              "Cardiac Risk Markers",
+    "nt-probnp":                               "Cardiac Risk Markers",
+    "bnp":                                     "Cardiac Risk Markers",
+    "ldh":                                     "Cardiac Risk Markers",
+    "cpk":                                     "Cardiac Risk Markers",
+    "cpk-mb":                                  "Cardiac Risk Markers",
+    // ── Hormones ────────────────────────────────────────────────────────────
+    "cortisol":                                "Hormones",
+    "testosterone":                            "Hormones",
+    "estrogen":                                "Hormones",
+    "estradiol":                               "Hormones",
+    "progesterone":                            "Hormones",
+    "fsh":                                     "Hormones",
+    "lh":                                      "Hormones",
+    "prolactin":                               "Hormones",
+    "dhea":                                    "Hormones",
+    "dhea-s":                                  "Hormones",
+    "igf-1":                                   "Hormones",
+    "growth hormone":                          "Hormones",
+    "parathyroid hormone (pth)":               "Hormones",
+    "pth":                                     "Hormones",
+    // ── Infectious Disease / Serology ───────────────────────────────────────
+    "hbsag":                                   "Infectious Disease / Serology",
+    "hepatitis b surface antigen":             "Infectious Disease / Serology",
+    "anti-hcv":                                "Infectious Disease / Serology",
+    "hiv 1 & 2":                               "Infectious Disease / Serology",
+    "vdrl":                                    "Infectious Disease / Serology",
+    "widal test":                              "Infectious Disease / Serology",
+    "dengue ns1 antigen":                      "Infectious Disease / Serology",
+    "malaria antigen":                         "Infectious Disease / Serology",
+    // ── Coagulation Profile ─────────────────────────────────────────────────
+    "prothrombin time (pt)":                   "Coagulation Profile",
+    "pt/inr":                                  "Coagulation Profile",
+    "inr":                                     "Coagulation Profile",
+    "aptt":                                    "Coagulation Profile",
+    "fibrinogen":                              "Coagulation Profile",
+    "bleeding time":                           "Coagulation Profile",
+    "clotting time":                           "Coagulation Profile",
+    "d-dimer":                                 "Coagulation Profile",
+  };
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     ruleBasedClassify — deterministic fallback.
+     1. Checks the TEST_LOOKUP table first (exact match after lower-casing).
+     2. Falls back to regex patterns for partial / variant names.
+     3. "Other Tests" is always placed last via CATEGORY_ORDER sort.
+  ═══════════════════════════════════════════════════════════════════════════ */
   const ruleBasedClassify = (tests) => {
-    const RULES = [
-      { cat: "Urine Routine Analysis",      re: /^urine\b|urobilinogen|microalbumin|amorphous|urine\s*acr|urine\s*potassium/i },
-      { cat: "Lipid Profile",               re: /cholesterol|hdl|ldl|vldl|triglyceride|apolipoprotein|lipid/i },
-      { cat: "Diabetes Profile",            re: /blood\s*sugar|fbs|hba1c|glycat|food\s*tolerance|ppbs|insulin/i },
-      { cat: "Kidney Function Tests",       re: /creatinine.*blood|blood.*creatinine|uric\s*acid|bun|blood\s*urea|bun\/|egfr/i },
-      { cat: "Thyroid Profile",             re: /tsh|triiodothyronine|thyroxine|\bt3\b|\bt4\b|thyroid/i },
-      { cat: "Liver Function Tests",        re: /bilirubin|sgot|sgpt|\balt\b|\bast\b|\balp\b|ggt|albumin.*serum|serum.*albumin|globulin|liver/i },
-      { cat: "Complete Blood Count (CBC)",  re: /haemoglobin|hemoglobin|platelet|wbc|rbc\s*count|\brdw\b|\bpdw\b|\bp-lcr\b|nucleated.*red|mch|mcv|mchc|hct|hematocrit|neutrophil|lymphocyte|monocyte|eosinophil|basophil|differential|leukocyte/i },
-      { cat: "Iron Studies",                re: /serum\s*iron|iron\s*test|tibc|transferrin|ferritin/i },
-      { cat: "Vitamins",                    re: /vitamin/i },
-      { cat: "Electrolytes & Minerals",     re: /sodium|potassium.*serum|serum.*potassium|chloride|calcium|magnesium|phosphorus|bicarbonate|electrolyte/i },
-      { cat: "Cardiac Risk Markers",        re: /hs-crp|crp|homocysteine|troponin|bnp|ldh|cpk|cardiac/i },
-      { cat: "Hormones",                    re: /cortisol|testosterone|estrogen|progesterone|\bfsh\b|\blh\b|prolactin|dhea|igf|hormone/i },
-      { cat: "Infectious Disease / Serology", re: /hbsag|hiv|vdrl|dengue|malaria|typhoid|widal|hepatitis|serology/i },
-      { cat: "Coagulation Profile",         re: /prothrombin|\bpt\b|\binr\b|aptt|fibrinogen|bleeding\s*time|clotting\s*time/i },
+    const REGEX_RULES = [
+      { cat: "Urine Routine Analysis",        re: /^urine\b|urobilinogen|microalbumin(?!\s*creatinine)|amorphous\s*deposit|urine\s*acr|spot\s*urine|24.hour.urine/i },
+      { cat: "Lipid Profile",                 re: /cholesterol|hdl|ldl|vldl|triglyceride|apolipoprotein|lipid/i },
+      { cat: "Diabetes Profile",              re: /blood\s*sugar|fasting\s*sugar|\bfbs\b|hba1c|glycat|food\s*tolerance|\bppbs\b|\brbs\b|glucose\s*tolerance|insulin\s*fasting|c-peptide/i },
+      { cat: "Kidney Function Tests",         re: /creatinine[^,]*(blood|serum)?|serum\s*creatinine|\buric\s*acid\b(?!.*urine)|\bbun\b|blood\s*urea|bun[/\s]creat|\begfr\b|cystatin/i },
+      { cat: "Thyroid Profile",               re: /\btsh\b|triiodothyronine|\bthyroxine\b|\bft3\b|\bft4\b|\bt3\b|\bt4\b|anti-tpo|anti.thyroglobulin/i },
+      { cat: "Liver Function Tests",          re: /\bbilirubin\b(?!.*urine)|sgot|sgpt|\balt\b|\bast\b|\balp\b|alkaline\s*phosphatase|\bggt\b|gamma.gt|total\s*protein(?!.*urine)|serum\s*albumin|albumin[,\s]serum|\bglobulin\b|a\/g\s*ratio/i },
+      { cat: "Complete Blood Count (CBC)",    re: /haemoglobin|hemoglobin|\brbc\s*count\b|\bwbc\b|\bplatelets?\b|\bhct\b|hematocrit|haematocrit|\bmcv\b|\bmch\b|\bmchc\b|\brdw\b|\bpdw\b|\bp-lcr\b|nucleated.*red|neutrophil|lymphocyte|monocyte|eosinophil|basophil|differential.*count|\bmpv\b|nrbc/i },
+      { cat: "Iron Studies",                  re: /\biron\b(?!.*urine)|\btibc\b|transferrin\s*saturation|\bferritin\b/i },
+      { cat: "Vitamins",                      re: /\bvitamin\b/i },
+      { cat: "Electrolytes & Minerals",       re: /\bcalcium\b(?!.*urine)|\bsodium\b(?!.*urine)|\bpotassium\b(?!.*urine)|\bchloride\b(?!.*urine)|\bmagnesium\b|\bphosphorus\b(?!.*urine)|\bbicarbonate\b|electrolyte/i },
+      { cat: "Cardiac Risk Markers",          re: /hs-crp|\bcrp\b|homocysteine|troponin|\bbnp\b|nt-probnp|\bldh\b|\bcpk\b/i },
+      { cat: "Hormones",                      re: /\bcortisol\b|testosterone|estradiol|estrogen|progesterone|\bfsh\b|\blh\b|\bprolactin\b|\bdhea\b|igf-1|growth\s*hormone|\bpth\b|parathyroid/i },
+      { cat: "Infectious Disease / Serology", re: /hbsag|anti-hcv|\bhiv\b|\bvdrl\b|\bwidal\b|dengue|malaria|hepatitis.*antigen|serology/i },
+      { cat: "Coagulation Profile",           re: /prothrombin|\bpt\/inr\b|\binr\b|\baptt\b|\bfibrinogen\b|bleeding\s*time|clotting\s*time|d-dimer/i },
     ];
 
     const result = {};
     for (const test of tests) {
+      const key = test.trim().toLowerCase();
+      // 1. Exact lookup table match
+      if (TEST_LOOKUP[key]) {
+        const cat = TEST_LOOKUP[key];
+        if (!result[cat]) result[cat] = [];
+        result[cat].push(test);
+        continue;
+      }
+      // 2. Regex fallback
       let placed = false;
-      for (const { cat, re } of RULES) {
+      for (const { cat, re } of REGEX_RULES) {
         if (re.test(test)) {
           if (!result[cat]) result[cat] = [];
           result[cat].push(test);
@@ -2226,7 +2498,68 @@ export default function MediSort_AI() {
         result["Other Tests"].push(test);
       }
     }
-    return result;
+    // Enforce canonical category order — "Other Tests" is always last
+    return reorderCategories(result);
+  };
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     reorderCategories — sorts a categories object by CATEGORY_ORDER.
+     Unknown / AI-invented category names are normalised to the nearest
+     known one (case-insensitive); if unrecognised they go to "Other Tests".
+     "Other Tests" is always placed last regardless of insertion order.
+  ═══════════════════════════════════════════════════════════════════════════ */
+  const reorderCategories = (rawCats) => {
+    // Build a lower-cased lookup for fuzzy name normalisation
+    const orderLower = CATEGORY_ORDER.map(c => c.toLowerCase());
+
+    // Normalise keys: exact → canonical; unknown → "Other Tests"
+    const normalised = {};
+    for (const [rawKey, tests] of Object.entries(rawCats)) {
+      const idx = orderLower.indexOf(rawKey.trim().toLowerCase());
+      const canonical = idx !== -1 ? CATEGORY_ORDER[idx] : "Other Tests";
+      if (!normalised[canonical]) normalised[canonical] = [];
+      normalised[canonical].push(...tests);
+    }
+
+    // Rebuild in CATEGORY_ORDER sequence (skipping absent categories)
+    const ordered = {};
+    for (const cat of CATEGORY_ORDER) {
+      if (normalised[cat] && normalised[cat].length > 0) {
+        ordered[cat] = normalised[cat];
+      }
+    }
+    return ordered;
+  };
+
+  /* ═══════════════════════════════════════════════════════════════════════════
+     postProcessCategories — runs after the AI returns its result.
+     1. Normalises and orders category names via reorderCategories.
+     2. Detects any input tests that were dropped (hallucination / omission)
+        and re-classifies them using ruleBasedClassify.
+     3. Ensures "Other Tests" is always the last category.
+  ═══════════════════════════════════════════════════════════════════════════ */
+  const postProcessCategories = (aiCategories, originalTests) => {
+    // Step A: normalise + order what the AI gave us
+    const ordered = reorderCategories(aiCategories);
+
+    // Step B: find tests that the AI silently dropped
+    const covered = new Set(
+      Object.values(ordered).flat().map(t => t.trim().toLowerCase())
+    );
+    const dropped = originalTests.filter(t => !covered.has(t.trim().toLowerCase()));
+
+    if (dropped.length > 0) {
+      console.warn(`postProcess: ${dropped.length} test(s) were missing from AI output — reclassifying:`, dropped);
+      const recovered = ruleBasedClassify(dropped);
+      for (const [cat, tests] of Object.entries(recovered)) {
+        if (!ordered[cat]) ordered[cat] = [];
+        ordered[cat].push(...tests);
+      }
+      // Re-sort after adding recovered tests
+      return reorderCategories(ordered);
+    }
+
+    return ordered;
   };
 
   const processFile = async () => {
@@ -2243,31 +2576,22 @@ export default function MediSort_AI() {
       updateStep(0, "active", "Identifying columns…");
       await new Promise(r => setTimeout(r, 700));
 
-      // Use the maximum column count across ALL rows so short header rows
-      // don't under-count real data columns
       const numCols = Math.max(...rawData.map(row => (row || []).length));
-
-      // Build one package object per detected column using dynamic metadata detection.
-      // detectColumnMeta scans the first 5 rows per column for serviceLocation /
-      // ageGender / price via regex — never relies on fixed row positions.
       const packages = Array.from({ length: numCols }, (_, c) => {
         const meta = detectColumnMeta(rawData, c);
         return {
-          serviceLocation: meta.serviceLocation,   // "" when not detected
-          ageGender:       meta.ageGender,          // "" when not detected
-          price:           meta.price,              // "" when not detected
-          tests:           meta.tests,              // all non-metadata rows
+          serviceLocation: meta.serviceLocation,
+          ageGender:       meta.ageGender,
+          price:           meta.price,
+          tests:           meta.tests,
           packageName:     "",
           displayName:     "",
           categories:      {},
         };
       });
-
-      // Drop columns that have no metadata AND no tests (truly empty columns)
       const validPackages = packages.filter(
         p => p.tests.length > 0 || p.serviceLocation || p.price
       );
-
       updateStep(0, "done",
         `${validPackages.length} packages detected · max ${Math.max(...validPackages.map(p => p.tests.length))} tests`
       );
@@ -2283,92 +2607,137 @@ export default function MediSort_AI() {
         updateStep(2, "active", `Classifying package ${i + 1} of ${validPackages.length}…`);
         const p = validPackages[i];
 
-        // ── Authoritative category taxonomy with keyword hints ─────────────────
-        // Gemini must match every test to exactly one of these categories.
-        // The keyword lists are hints — not exhaustive — to resolve ambiguous tests.
-        const TAXONOMY = `
-ALLOWED CATEGORIES (use these exact names, in this priority order):
-1.  "Urine Routine Analysis"     — anything prefixed "Urine", urobilinogen, microalbumin, urine ACR, urine potassium, amorphous deposits
-2.  "Lipid Profile"              — cholesterol, HDL, LDL, VLDL, triglycerides, apolipoproteins, lipid ratios
-3.  "Diabetes Profile"           — blood sugar, FBS, HbA1c, glycated, food tolerance test, PPBS, insulin
-4.  "Kidney Function Tests"      — creatinine (blood), uric acid, BUN, BUN/creatinine ratio, eGFR
-5.  "Thyroid Profile"            — TSH, T3, T4, triiodothyronine, thyroxine, thyroid
-6.  "Liver Function Tests"       — bilirubin (serum/total/direct/indirect), SGOT, SGPT, ALT, AST, ALP, GGT, albumin (serum), total protein, globulin
-7.  "Complete Blood Count (CBC)" — haemoglobin, RBC count, WBC, platelet, HCT, MCV, MCH, MCHC, RDW, PDW, P-LCR, nucleated RBC, differential count, neutrophil, lymphocyte, monocyte, eosinophil, basophil
-8.  "Iron Studies"               — serum iron, TIBC, transferrin saturation, ferritin
-9.  "Vitamins"                   — vitamin B12, vitamin D, folate, folic acid, vitamin C, vitamin A
-10. "Electrolytes & Minerals"    — sodium, potassium (serum), chloride, calcium (serum), magnesium, phosphorus, bicarbonate
-11. "Cardiac Risk Markers"       — CRP, hs-CRP, homocysteine, troponin, BNP, LDH, CPK, cardiac enzymes
-12. "Hormones"                   — cortisol, testosterone, estrogen, progesterone, FSH, LH, prolactin, DHEA, IGF
-13. "Infectious Disease / Serology" — HBsAg, HIV, VDRL, dengue, malaria, typhoid, widal, hepatitis, CRP (infection context)
-14. "Coagulation Profile"        — PT, INR, APTT, fibrinogen, bleeding time, clotting time
-15. "Other Tests"                — any test that genuinely does not fit the above categories`;
+        // ── Build the per-test cheat-sheet from TEST_LOOKUP for tests in this package ──
+        // Only include entries whose key appears (case-insensitively) in the test list.
+        // This keeps the prompt lean while giving Gemini exact anchors for every
+        // test it is about to classify — eliminating the main source of misclassification.
+        const cheatSheetLines = p.tests
+          .map(t => {
+            const cat = TEST_LOOKUP[t.trim().toLowerCase()];
+            return cat ? `  "${t}" → ${cat}` : null;
+          })
+          .filter(Boolean);
 
-        const prompt = `You are a senior medical laboratory data classification specialist.
+        const cheatSheetSection = cheatSheetLines.length > 0
+          ? `\n━━━ PRE-RESOLVED MAPPINGS (use these EXACTLY — do not override) ━━━\n${cheatSheetLines.join("\n")}\n`
+          : "";
 
-Your task: classify every test in the input list into the correct clinical category, then return a JSON object.
+        // ── Canonical category names injected into the prompt ─────────────────
+        const taxonomyLines = CATEGORY_ORDER
+          .filter(c => c !== "Other Tests")
+          .map((c, idx) => {
+            const hints = {
+              "Urine Routine Analysis":        "anything prefixed 'Urine', urobilinogen, microalbumin, urine ACR, amorphous deposits",
+              "Lipid Profile":                 "cholesterol, HDL, LDL, VLDL, triglycerides, apolipoproteins, lipid ratios",
+              "Diabetes Profile":              "FBS, HbA1c, food tolerance test, PPBS, RBS, GTT, insulin fasting, C-peptide",
+              "Kidney Function Tests":         "creatinine (blood/serum), uric acid (serum), BUN, BUN/creatinine ratio, eGFR",
+              "Thyroid Profile":               "TSH, T3, T4, free T3/T4, triiodothyronine, thyroxine, anti-TPO",
+              "Liver Function Tests":          "bilirubin, SGOT/SGPT/ALT/AST/ALP/GGT, albumin (serum), total protein, globulin",
+              "Complete Blood Count (CBC)":    "haemoglobin, RBC/WBC/platelet counts, HCT, MCV/MCH/MCHC, RDW, PDW, P-LCR, nucleated RBC, differential",
+              "Iron Studies":                  "serum iron, TIBC, transferrin saturation, ferritin",
+              "Vitamins":                      "vitamin D, vitamin B12, folate, vitamin C/A/E/K",
+              "Electrolytes & Minerals":       "calcium (serum), sodium, potassium (serum), chloride, magnesium, phosphorus",
+              "Cardiac Risk Markers":          "hs-CRP, CRP, homocysteine, troponin, BNP, LDH, CPK",
+              "Hormones":                      "cortisol, testosterone, estrogen, FSH, LH, prolactin, DHEA, IGF-1, PTH",
+              "Infectious Disease / Serology": "HBsAg, anti-HCV, HIV, VDRL, widal, dengue, malaria, hepatitis antigens",
+              "Coagulation Profile":           "PT/INR, APTT, fibrinogen, bleeding time, clotting time, D-dimer",
+            };
+            return `${idx + 1}.  "${c}" — ${hints[c] || ""}`;
+          })
+          .join("\n");
 
-━━━ INPUT TESTS ━━━
-${p.tests.join("\n")}
+        const prompt = `You are a senior medical laboratory classification specialist with 20 years of experience.
+
+Your task: assign every test in the INPUT LIST to exactly one clinical category, then return a JSON object.
+
+━━━ INPUT LIST (${p.tests.length} tests) ━━━
+${p.tests.map((t, n) => `${n + 1}. ${t}`).join("\n")}
 
 ━━━ PACKAGE METADATA ━━━
 Service Location: ${p.serviceLocation || "Not specified"}
-Age/Gender: ${p.ageGender || "Not specified"}
-Price: ${p.price || "Not specified"}
+Age/Gender:       ${p.ageGender       || "Not specified"}
+Price:            ${p.price           || "Not specified"}
+${cheatSheetSection}
+━━━ ALLOWED CATEGORIES (use these exact names only) ━━━
+${taxonomyLines}
+15. "Other Tests" — ONLY for tests that genuinely fit none of categories 1–14
 
-━━━ TAXONOMY ━━━
-${TAXONOMY}
+━━━ DISAMBIGUATION RULES ━━━
+• "Microalbumin" / "Urine Albumin to Creatinine Ratio (ACR)" / "Urine Potassium" → Urine Routine Analysis
+• "Calcium, Serum" → Electrolytes & Minerals  (NOT Kidney)
+• "Food Tolerance Test" → Diabetes Profile
+• "Apolipoproteins A1+B" → Lipid Profile
+• "BUN/Creatinine Ratio" → Kidney Function Tests
+• "Urine Bilirubin" → Urine Routine Analysis  (NOT Liver Function Tests)
+• "Urine Glucose" → Urine Routine Analysis  (NOT Diabetes Profile)
+• "Uric Acid, Serum" → Kidney Function Tests  (NOT Electrolytes)
+• RDW-CV, RDW-SD, PDW, P-LCR, Nucleated RBC → Complete Blood Count (CBC)
+• "Serum Iron" / "TIBC" → Iron Studies  (NOT Electrolytes)
 
-━━━ EXAMPLE (for reference — do not copy, classify the actual tests above) ━━━
-Input: ["TSH", "Serum Iron", "Urine Protein", "HbA1c", "Vitamin B12", "Haemoglobin"]
-Output categories:
+━━━ WORKED EXAMPLE (illustrative — classify YOUR tests above, not these) ━━━
+Input:  TSH | Serum Iron | Urine Protein | HbA1c | Vitamin B12 | Haemoglobin | Calcium, Serum | Microalbumin
+Output:
   "Thyroid Profile"            → ["TSH"]
   "Iron Studies"               → ["Serum Iron"]
-  "Urine Routine Analysis"     → ["Urine Protein"]
+  "Urine Routine Analysis"     → ["Urine Protein", "Microalbumin"]
   "Diabetes Profile"           → ["HbA1c"]
   "Vitamins"                   → ["Vitamin B12"]
   "Complete Blood Count (CBC)" → ["Haemoglobin"]
+  "Electrolytes & Minerals"    → ["Calcium, Serum"]
 
-━━━ STRICT RULES ━━━
-1. EVERY test from the input MUST appear in exactly one category. Zero omissions.
-2. Use ONLY category names from the taxonomy above. Do NOT invent new names.
-3. NEVER use "General Tests", "Miscellaneous", "Others" unless a test truly fits none of the 14 named categories.
-4. Do NOT merge all tests into one category — the output MUST have multiple categories if the tests span multiple domains.
-5. Copy test names EXACTLY as given — no rewording, no capitalisation changes.
-6. Return ONLY valid JSON — no markdown fences, no explanation, no preamble.
+━━━ ABSOLUTE RULES ━━━
+1. EVERY numbered test above MUST appear in the output. Count: ${p.tests.length} in → ${p.tests.length} out.
+2. No test may appear in more than one category.
+3. Copy test names character-for-character — zero changes to spelling, punctuation, or capitalisation.
+4. Use ONLY the 15 category names listed above. Never invent names.
+5. "Other Tests" is a last resort — use it for at most 1–2 truly unclassifiable tests.
+6. Output ONLY the JSON object below — no markdown fences, no prose, no explanation.
 
 ━━━ OUTPUT FORMAT ━━━
 {
-  "packageName": "SHORT-CODE e.g. COMP-HEALTH-ADV",
-  "displayName": "Full human-readable package title",
+  "packageName": "SHORT-CODE",
+  "displayName": "Human-readable package title",
   "categories": {
-    "Category Name": ["Exact Test Name 1", "Exact Test Name 2"]
+    "Category Name": ["Test 1", "Test 2"]
   }
 }`;
 
-        // ── Classify with automatic retry if model collapses to one category ──
-        const classify = async (retryPrompt) => {
-          const raw    = await callGemini([{ role: "user", content: retryPrompt }]);
-          const parsed = extractJSON(raw);
-          return parsed;
+        // ── Classify — temperature:0 for deterministic output ─────────────────
+        const classify = async (thePrompt) => {
+          const raw = await callGemini(
+            [{ role: "user", content: thePrompt }],
+            "",       // no separate system prompt — instructions are in the user turn
+            4096,
+            { temperature: 0 }   // deterministic — eliminates random misclassification
+          );
+          return extractJSON(raw);
         };
 
         try {
           let parsed = await classify(prompt);
 
-          // ── Validation: reject single-bucket responses and retry once ─────────
-          const catKeys = parsed?.categories ? Object.keys(parsed.categories) : [];
+          // ── Validation gate 1: single-bucket collapse ─────────────────────
+          const catKeys    = parsed?.categories ? Object.keys(parsed.categories) : [];
           const totalTests = p.tests.length;
-          const isSingleBucket = catKeys.length === 1 && totalTests > 5;
+          const isSingleBucket = catKeys.length === 1 && totalTests > 4;
 
-          if (isSingleBucket) {
-            console.warn(`Package ${i + 1}: single-category collapse detected ("${catKeys[0]}") — retrying with stricter prompt…`);
+          // ── Validation gate 2: too many tests dumped in "Other Tests" ─────
+          const otherCount  = (parsed?.categories?.["Other Tests"] || []).length;
+          const otherHeavy  = otherCount > Math.max(2, totalTests * 0.25);
+
+          if (isSingleBucket || otherHeavy) {
+            const reason = isSingleBucket
+              ? `all ${totalTests} tests collapsed into "${catKeys[0]}"`
+              : `${otherCount}/${totalTests} tests dumped into "Other Tests"`;
+            console.warn(`Package ${i + 1}: classification issue (${reason}) — retrying…`);
+
             const retryPrompt = prompt + `
 
-⚠️ CRITICAL CORRECTION REQUIRED:
-Your previous response grouped ALL ${totalTests} tests into a single category ("${catKeys[0]}").
-This is WRONG. These tests belong to MULTIPLE distinct clinical categories.
-You MUST split them correctly across the taxonomy. Returning a single category is a classification failure.`;
+⚠️ YOUR PREVIOUS RESPONSE HAD A CRITICAL ERROR: ${reason}.
+This means you ignored the taxonomy. Every test has a specific clinical home.
+Re-read the DISAMBIGUATION RULES and PRE-RESOLVED MAPPINGS above and reclassify ALL ${totalTests} tests correctly.
+Do NOT use "Other Tests" for tests that clearly belong in a named category.`;
+
             parsed = await classify(retryPrompt);
           }
 
@@ -2380,9 +2749,9 @@ You MUST split them correctly across the taxonomy. Returning a single category i
             typeof parsed.categories === "object" &&
             Object.keys(parsed.categories).length > 0
           ) {
-            validPackages[i].categories = parsed.categories;
+            // Post-process: normalise names, enforce order, recover dropped tests
+            validPackages[i].categories = postProcessCategories(parsed.categories, p.tests);
           } else {
-            // Last-resort rule-based fallback — never dumps everything into one bucket
             validPackages[i].categories = ruleBasedClassify(p.tests);
           }
 
@@ -2390,7 +2759,6 @@ You MUST split them correctly across the taxonomy. Returning a single category i
           console.warn(`Package ${i + 1} classification failed:`, err.message);
           validPackages[i].packageName = "";
           validPackages[i].displayName = "";
-          // Rule-based fallback preserves clinical structure even without AI
           validPackages[i].categories  = ruleBasedClassify(p.tests);
         }
 
