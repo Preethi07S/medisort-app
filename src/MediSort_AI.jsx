@@ -9,21 +9,71 @@ import {
 } from "lucide-react";
 
 /* ─────────────────────────── HELPERS ─────────────────────────── */
-async function callClaude(messages, systemPrompt = "", maxTokens = 4096) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+
+// ── Gemini configuration ────────────────────────────────────────────────────
+// Model: gemini-2.0-flash  (fast, cost-efficient, supports system instructions)
+// API key is read from VITE_GEMINI_API_KEY in your .env file.
+const GEMINI_MODEL   = "gemini-2.0-flash";
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+const GEMINI_API_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+
+/**
+ * callGemini — drop-in replacement for the former callClaude helper.
+ *
+ * Maps the Anthropic message schema (role:"user"|"assistant") onto Gemini's
+ * schema (role:"user"|"model") and returns a plain text string, preserving
+ * the same return type so all downstream callers continue to work unchanged.
+ *
+ * @param {Array<{role:string, content:string}>} messages  - Conversation turns
+ * @param {string} systemPrompt  - Optional system / persona instruction
+ * @param {number} maxTokens     - Max output tokens (default 4096)
+ * @returns {Promise<string>}    - Model reply as plain text
+ */
+async function callGemini(messages, systemPrompt = "", maxTokens = 4096) {
+  const body = {
+    // Gemini separates system instructions from conversation contents
+    ...(systemPrompt && {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+    }),
+    // Anthropic uses "assistant"; Gemini uses "model" — map here
+    contents: messages.map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    })),
+    generationConfig: {
+      maxOutputTokens: maxTokens,
+    },
+  };
+
+  const res = await fetch(GEMINI_API_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: maxTokens,
-      system: systemPrompt,
-      messages,
-    }),
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Gemini API error:", errText);
+    throw new Error(`HTTP ${res.status}`);
+  }
+
   const data = await res.json();
-  if (data.error) throw new Error(data.error.message || "API error");
-  return data.content?.map(b => b.text || "").join("") || "";
+
+  if (data.error) {
+    throw new Error(data.error.message || "Gemini API error");
+  }
+
+  // Surface safety-block reason so callers can surface it to the user
+  const blockReason = data.promptFeedback?.blockReason;
+  if (blockReason) throw new Error(`Request blocked by Gemini: ${blockReason}`);
+
+  // Collect all text parts from the first candidate (mirrors callClaude's join)
+  return (
+    data.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text || "")
+      .join("") || ""
+  );
 }
 
 /* Robust JSON extractor — handles markdown fences, leading/trailing prose */
@@ -405,9 +455,11 @@ function decodeGoogleJwt(token) {
 
 function LoginScreen({ onLogin }) {
 
-  // ✅ PUT YOUR GOOGLE CLIENT ID HERE
-  const clientId = 
-      import.meta.env.VITE_GOOGLE_CLIENT_ID;
+  // Google OAuth Client ID — set VITE_GOOGLE_CLIENT_ID in:
+  //   • Local dev : .env  (VITE_GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com)
+  //   • Production: Vercel → Settings → Environment Variables → then redeploy
+  // Same value is reused by the Gmail share tab — no second credential needed.
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -490,6 +542,17 @@ function LoginScreen({ onLogin }) {
      Initialize Google OAuth
   ───────────────────────────────────────────── */
   const initGoogle = async () => {
+
+    // Guard: catch missing env var before hitting Google — gives a clear error
+    // instead of the cryptic "Error 400: Missing required parameter: client_id".
+    if (!clientId) {
+      setError(
+        "VITE_GOOGLE_CLIENT_ID is not configured. " +
+        "Add it to your .env file (local) or Vercel project → Settings → " +
+        "Environment Variables (production), then rebuild / redeploy."
+      );
+      return;
+    }
 
     setLoading(true);
     setError("");
@@ -701,6 +764,30 @@ function LoginScreen({ onLogin }) {
           </p>
 
           {/* Google OAuth Button */}
+
+          {/* ── Misconfig banner: shown when env var is missing ───────────── */}
+          {!clientId && (
+            <div style={{
+              display:"flex", gap:10, padding:"12px 14px", borderRadius:10,
+              background:"rgba(220,80,60,.08)", border:"1px solid rgba(220,80,60,.25)",
+              marginBottom:14,
+            }}>
+              <AlertTriangle size={32} color="#F08070" style={{ flexShrink:0, marginTop:2 }} />
+              <div style={{ fontSize:12, color:"#F08070", lineHeight:1.6 }}>
+                <strong style={{ display:"block", marginBottom:4 }}>
+                  VITE_GOOGLE_CLIENT_ID is not set
+                </strong>
+                <span style={{ color:"#A0B8C8" }}>
+                  Local dev: add it to your <code style={{ fontFamily:"monospace" }}>.env</code> file and restart Vite.
+                  <br/>
+                  Vercel: go to <strong>Project → Settings → Environment Variables</strong>,
+                  add <code style={{ fontFamily:"monospace" }}>VITE_GOOGLE_CLIENT_ID</code>, then
+                  <strong> Redeploy</strong>.
+                </span>
+              </div>
+            </div>
+          )}
+
           <div
             style={{
               display: "flex",
@@ -1259,7 +1346,7 @@ Always format your responses using clean markdown:
 Context: ${dataCtx}`;
 
     try {
-      const reply = await callClaude(
+      const reply = await callGemini(
         [...messages, userMsg].map(m => ({ role:m.role==="user"?"user":"assistant", content:m.content })),
         sys
       );
@@ -1484,88 +1571,129 @@ const SLACK_ICON = (
   </svg>
 );
 
+/* ─────────────────────────────────────────────────────────────────────────────
+   Gmail OAuth token cache
+   Scoped to the module (survives React re-renders, cleared on tab close).
+   Avoids a repeated Google consent popup within the same browser session —
+   the popup only appears on the very first "Create Draft" click per tab.
+   ───────────────────────────────────────────────────────────────────────────── */
+const _gmailTokenCache = { token: null, expiresAt: 0 };
+const _gmailGetCached  = () =>
+  _gmailTokenCache.token && Date.now() < _gmailTokenCache.expiresAt - 60_000
+    ? _gmailTokenCache.token : null;
+const _gmailSetCached  = (token, expiresIn = 3600) => {
+  _gmailTokenCache.token     = token;
+  _gmailTokenCache.expiresAt = Date.now() + expiresIn * 1_000;
+};
+
+/**
+ * acquireGmailToken
+ * Ensures the Google Identity Services script is loaded, then returns a valid
+ * OAuth access token — reusing a cached one when it hasn't expired yet so
+ * users aren't prompted on every send within the same session.
+ *
+ * @param {string} clientId  — VITE_GOOGLE_CLIENT_ID (set once at deploy time)
+ */
+async function acquireGmailToken(clientId) {
+  const cached = _gmailGetCached();
+  if (cached) return cached;
+
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      const client = window.google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope:     "https://www.googleapis.com/auth/gmail.compose",
+        callback:  resp => {
+          if (resp.error) {
+            reject(new Error(resp.error_description || resp.error));
+          } else {
+            // Cache immediately so subsequent sends skip the popup
+            _gmailSetCached(resp.access_token, Number(resp.expires_in) || 3600);
+            resolve(resp.access_token);
+          }
+        },
+      });
+      // `select_account` only prompts for account selection, never re-consent;
+      // Google silently reuses the previously granted permission.
+      client.requestAccessToken({ prompt: "select_account" });
+    };
+
+    // GIS is already loaded from the login screen in most cases
+    if (window.google?.accounts?.oauth2) { run(); return; }
+
+    // Fallback: dynamically load GIS (e.g., deep-link or hard refresh)
+    const s = document.createElement("script");
+    s.src     = "https://accounts.google.com/gsi/client";
+    s.onload  = run;
+    s.onerror = () => reject(new Error("Failed to load Google Identity Services"));
+    document.head.appendChild(s);
+  });
+}
+
 /* ── Gmail Tab ─────────────────────────────────────────────────────── */
 function GmailTab({ fileName, blob, subject }) {
-  const [to,        setTo]        = useState("");
-  const [clientId,  setClientId]  = useState("");
-  const [loading,   setLoading]   = useState(false);
-  const [steps,     setSteps]     = useState([]);  // [{label, status}]
-  const [error,     setError]     = useState("");
+  // ── OAuth client ID read from the environment — same var used for Google Sign-In.
+  // Set VITE_GOOGLE_CLIENT_ID in .env (local) or Vercel project settings (production).
+  // No user input, no per-session prompt — just works after first consent click.
+  const OAUTH_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+  const isConfigured    = Boolean(OAUTH_CLIENT_ID);
+
+  const [to,      setTo]      = useState("");
+  const [loading, setLoading] = useState(false);
+  const [steps,   setSteps]   = useState([]);
+  const [error,   setError]   = useState("");
 
   const BODY = `Hi,\n\nPlease find the processed medical package file attached.\n\nFile: ${fileName}\n\nGenerated by MediSort AI.`;
-
   const tick  = (i, status, extra = "") =>
     setSteps(prev => prev.map((s, j) => j === i ? { ...s, status, extra } : s));
 
   const handleSend = async () => {
-    if (!clientId.trim()) { setError("Google OAuth Client ID is required."); return; }
+    if (!isConfigured) {
+      setError("VITE_GOOGLE_CLIENT_ID is not configured. Add it to your Vercel environment variables.");
+      return;
+    }
     setError("");
     setLoading(true);
-    const STEPS_DEF = [
+    setSteps([
       { label: "Authenticate with Google" },
       { label: "Build email with attachment" },
       { label: "Create Gmail draft" },
       { label: "Open draft in Gmail" },
-    ];
-    setSteps(STEPS_DEF.map(s => ({ ...s, status: "pending" })));
+    ].map(s => ({ ...s, status: "pending" })));
 
     try {
-      // ── Step 0: OAuth via Google Identity Services ───────────────
+      // ── Step 0: Acquire OAuth token (cached — popup fires at most once per tab) ──
       tick(0, "active");
-      const accessToken = await new Promise((resolve, reject) => {
-        // Dynamically load GIS if not already present
-        const load = () => {
-          const client = window.google.accounts.oauth2.initTokenClient({
-            client_id: clientId.trim(),
-            scope: "https://www.googleapis.com/auth/gmail.compose",
-            callback: resp => {
-              if (resp.error) reject(new Error(resp.error_description || resp.error));
-              else resolve(resp.access_token);
-            },
-          });
-          client.requestAccessToken({ prompt: "consent" });
-        };
-        if (window.google?.accounts?.oauth2) {
-          load();
-        } else {
-          const script = document.createElement("script");
-          script.src = "https://accounts.google.com/gsi/client";
-          script.onload = load;
-          script.onerror = () => reject(new Error("Failed to load Google Identity Services"));
-          document.head.appendChild(script);
-        }
-      });
+      const accessToken = await acquireGmailToken(OAUTH_CLIENT_ID);
       tick(0, "done");
 
-      // ── Step 1: Build MIME email ──────────────────────────────────
+      // ── Step 1: Build MIME email with XLSX attachment ─────────────────────────
       tick(1, "active");
       const raw = await buildMimeRaw(to || "", subject, BODY, fileName, blob);
       tick(1, "done");
 
-      // ── Step 2: Create Gmail draft via API ────────────────────────
+      // ── Step 2: Create Gmail draft via Gmail REST API ─────────────────────────
       tick(2, "active");
       const draftRes = await fetch(
         "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
         {
           method:  "POST",
-          headers: {
-            Authorization:  `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ message: { raw } }),
+          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          body:    JSON.stringify({ message: { raw } }),
         }
       );
       if (!draftRes.ok) {
         const err = await draftRes.json();
+        // Token may have expired mid-session — evict cache so next attempt re-authenticates
+        if (draftRes.status === 401) _gmailTokenCache.token = null;
         throw new Error(err?.error?.message || `Gmail API ${draftRes.status}`);
       }
       const draft = await draftRes.json();
       tick(2, "done", draft.id);
 
-      // ── Step 3: Open the draft ────────────────────────────────────
+      // ── Step 3: Open the draft directly in Gmail ──────────────────────────────
       tick(3, "active");
       await new Promise(r => setTimeout(r, 400));
-      // Gmail draft deep-link — opens the draft directly with attachment visible
       window.open(`https://mail.google.com/mail/#drafts/${draft.id}`, "_blank");
       tick(3, "done");
     } catch (err) {
@@ -1577,43 +1705,55 @@ function GmailTab({ fileName, blob, subject }) {
   };
 
   const StepIcon = ({ status }) => {
-    if (status === "done")    return <Check size={11} color="#00D4B4" />;
-    if (status === "active")  return <Loader2 size={11} color="#0096E0" className="spin" />;
-    if (status === "error")   return <AlertTriangle size={11} color="#F08070" />;
+    if (status === "done")   return <Check size={11} color="#00D4B4" />;
+    if (status === "active") return <Loader2 size={11} color="#0096E0" className="spin" />;
+    if (status === "error")  return <AlertTriangle size={11} color="#F08070" />;
     return <span style={{ fontSize:10, color:"#4A6070" }}>·</span>;
   };
 
   return (
     <div className="share-body">
-      <div className="info-box">
-        The XLSX file will be attached directly to a new Gmail draft using the Gmail API.
-        You need a <strong>Google OAuth 2.0 Client ID</strong> with the Gmail compose scope enabled.
-        <a href="https://console.cloud.google.com/apis/credentials" target="_blank"
-          style={{ color:"#5BA8F5", marginLeft:5 }}>Get one here ↗</a>
+
+      {/* ── OAuth config status pill ────────────────────────────────────── */}
+      <div style={{
+        display:"flex", alignItems:"center", gap:8, padding:"8px 12px",
+        borderRadius:8, marginBottom:14,
+        background: isConfigured ? "rgba(0,210,180,.07)" : "rgba(220,80,60,.07)",
+        border: `1px solid ${isConfigured ? "rgba(0,210,180,.2)" : "rgba(220,80,60,.2)"}`,
+      }}>
+        {isConfigured
+          ? <Check size={13} color="#00D4B4" />
+          : <AlertTriangle size={13} color="#F08070" />}
+        <span style={{ fontSize:12, color: isConfigured ? "#7ABEDC" : "#F08070", lineHeight:1.4 }}>
+          {isConfigured
+            ? <>OAuth configured via <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_GOOGLE_CLIENT_ID</code>
+                &nbsp;— sign-in popup appears only on first send per session.</>
+            : <>Set <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_GOOGLE_CLIENT_ID</code> in your Vercel project settings to enable Gmail drafts.</>}
+        </span>
       </div>
 
       {steps.length === 0 ? (
         <>
           <div className="share-field">
-            <label>Google OAuth Client ID</label>
-            <input className="input" value={clientId} onChange={e => setClientId(e.target.value)}
-              placeholder="xxx.apps.googleusercontent.com" style={{ fontSize:12 }} />
-          </div>
-          <div className="share-field" style={{ marginTop:12 }}>
-            <label>To (optional — fill in Gmail)</label>
+            <label>To (optional — fill in Gmail draft)</label>
             <input className="input" value={to} onChange={e => setTo(e.target.value)}
               placeholder="recipient@example.com" style={{ fontSize:12 }} />
           </div>
+
           <div style={{ marginTop:8, padding:"8px 10px", borderRadius:8,
-            background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.07)", fontSize:12, color:"#5A7488" }}>
+            background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.07)",
+            fontSize:12, color:"#5A7488" }}>
             <span style={{ color:"#4A6070" }}>Subject: </span>{subject}
           </div>
+
           {error && (
             <p style={{ color:"#F08070", fontSize:12, marginTop:8, display:"flex", alignItems:"center", gap:5 }}>
               <AlertTriangle size={12} /> {error}
             </p>
           )}
+
           <button className="btn btn-primary" onClick={handleSend}
+            disabled={!isConfigured || loading}
             style={{ width:"100%", marginTop:16, justifyContent:"center", display:"flex", alignItems:"center", gap:7 }}>
             {GMAIL_ICON} Create Gmail Draft with Attachment
           </button>
@@ -1640,7 +1780,7 @@ function GmailTab({ fileName, blob, subject }) {
             <div style={{ marginTop:12, padding:"10px 12px", borderRadius:9,
               background:"rgba(0,210,180,.08)", border:"1px solid rgba(0,210,180,.18)",
               color:"#00D4B4", fontSize:13, display:"flex", alignItems:"center", gap:8 }}>
-              <Check size={15} /> Draft created — Gmail opened with {fileName} attached
+              <Check size={15} /> Draft created — Gmail opened with {fileName} attached ✓
             </div>
           )}
         </div>
@@ -1651,13 +1791,19 @@ function GmailTab({ fileName, blob, subject }) {
 
 /* ── Slack Tab ─────────────────────────────────────────────────────── */
 function SlackTab({ fileName, blob, subject, packages }) {
-  const [webhookUrl,  setWebhookUrl]  = useState("");
-  const [botToken,    setBotToken]    = useState("");
-  const [channelId,   setChannelId]   = useState("");
-  const [loading,     setLoading]     = useState(false);
-  const [steps,       setSteps]       = useState([]);
-  const [error,       setError]       = useState("");
-  const [mode,        setMode]        = useState("webhook"); // "webhook" | "bot"
+  // ── Slack credentials from the environment — set once in Vercel project settings.
+  // Falls back to an editable text field when not set (e.g. local dev without .env).
+  const ENV_WEBHOOK    = import.meta.env.VITE_SLACK_WEBHOOK_URL  || "";
+  const ENV_BOT_TOKEN  = import.meta.env.VITE_SLACK_BOT_TOKEN    || "";
+  const ENV_CHANNEL_ID = import.meta.env.VITE_SLACK_CHANNEL_ID   || "";
+
+  const [webhookUrl, setWebhookUrl] = useState(ENV_WEBHOOK);
+  const [botToken,   setBotToken]   = useState(ENV_BOT_TOKEN);
+  const [channelId,  setChannelId]  = useState(ENV_CHANNEL_ID);
+  const [loading,    setLoading]    = useState(false);
+  const [steps,      setSteps]      = useState([]);
+  const [error,      setError]      = useState("");
+  const [mode,       setMode]       = useState("webhook"); // "webhook" | "bot"
 
   const tick = (i, status, extra = "") =>
     setSteps(prev => prev.map((s, j) => j === i ? { ...s, status, extra } : s));
@@ -1680,9 +1826,7 @@ function SlackTab({ fileName, blob, subject, packages }) {
     if (!webhookUrl.trim()) { setError("Webhook URL is required."); return; }
     setError("");
     setLoading(true);
-    setSteps([
-      { label: "Post notification to Slack" },
-    ].map(s => ({ ...s, status: "pending" })));
+    setSteps([{ label: "Post notification to Slack" }].map(s => ({ ...s, status: "pending" })));
 
     try {
       tick(0, "active");
@@ -1691,24 +1835,18 @@ function SlackTab({ fileName, blob, subject, packages }) {
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({ blocks: buildBlocks() }),
       });
-      if (!res.ok && res.status !== 0) {
-        // Webhooks return 200 "ok" text — non-200 is an error
-        throw new Error(`Slack responded with ${res.status}`);
-      }
+      if (!res.ok && res.status !== 0) throw new Error(`Slack responded with ${res.status}`);
       tick(0, "done");
     } catch (err) {
       // CORS blocks the response in browser — if the fetch itself didn't throw,
       // the message was likely delivered (Slack webhooks don't need a response body read)
       if (err.message.includes("Failed to fetch") || err.message.includes("NetworkError")) {
-        // Treat CORS-blocked response as success — webhook posts don't need CORS
         tick(0, "done");
       } else {
         setError(err.message);
         tick(0, "error");
       }
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   };
 
   const handleBotSend = async () => {
@@ -1728,7 +1866,7 @@ function SlackTab({ fileName, blob, subject, packages }) {
     try {
       // Step 0 — post the Block Kit message
       tick(0, "active");
-      const msgRes = await fetch("https://slack.com/api/chat.postMessage", {
+      const msgRes  = await fetch("https://slack.com/api/chat.postMessage", {
         method:  "POST",
         headers: { ...AUTH, "Content-Type": "application/json" },
         body:    JSON.stringify({ channel: channelId.trim(), blocks: buildBlocks() }),
@@ -1739,7 +1877,7 @@ function SlackTab({ fileName, blob, subject, packages }) {
 
       // Step 1 — get upload URL (Slack's two-step file upload API)
       tick(1, "active");
-      const urlRes = await fetch(
+      const urlRes  = await fetch(
         `https://slack.com/api/files.getUploadURLExternal?filename=${encodeURIComponent(fileName)}&length=${blob.size}`,
         { headers: AUTH }
       );
@@ -1759,7 +1897,7 @@ function SlackTab({ fileName, blob, subject, packages }) {
 
       // Step 3 — complete the upload and share into the channel
       tick(3, "active");
-      const completeRes = await fetch("https://slack.com/api/files.completeUploadExternal", {
+      const completeRes  = await fetch("https://slack.com/api/files.completeUploadExternal", {
         method:  "POST",
         headers: { ...AUTH, "Content-Type": "application/json" },
         body:    JSON.stringify({
@@ -1774,9 +1912,7 @@ function SlackTab({ fileName, blob, subject, packages }) {
     } catch (err) {
       setError(err.message);
       setSteps(prev => prev.map(s => s.status === "active" ? { ...s, status: "error" } : s));
-    } finally {
-      setLoading(false);
-    }
+    } finally { setLoading(false); }
   };
 
   const StepIcon = ({ status }) => {
@@ -1784,6 +1920,27 @@ function SlackTab({ fileName, blob, subject, packages }) {
     if (status === "active") return <Loader2 size={11} color="#0096E0" className="spin" />;
     if (status === "error")  return <AlertTriangle size={11} color="#F08070" />;
     return <span style={{ fontSize:10, color:"#4A6070" }}>·</span>;
+  };
+
+  // Renders a labelled credential field — pre-filled + editable when env var is set,
+  // blank + editable when not set so the user can supply it manually in local dev.
+  const CredentialField = ({ label, envVar, value, onChange, placeholder, type = "text" }) => {
+    const fromEnv = Boolean(envVar);
+    return (
+      <div className="share-field">
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+          <label style={{ margin:0 }}>{label}</label>
+          {fromEnv && (
+            <span style={{ fontSize:10, color:"#00D4B4", display:"flex", alignItems:"center", gap:4 }}>
+              <Check size={9} /> via env var
+            </span>
+          )}
+        </div>
+        <input className="input" value={value} onChange={e => onChange(e.target.value)}
+          placeholder={fromEnv ? "pre-filled from environment" : placeholder}
+          type={type} style={{ fontSize:12 }} />
+      </div>
+    );
   };
 
   return (
@@ -1807,35 +1964,43 @@ function SlackTab({ fileName, blob, subject, packages }) {
           {mode === "webhook" ? (
             <>
               <div className="info-box">
-                Paste an <strong>Incoming Webhook URL</strong> from your Slack workspace.
+                Set <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_SLACK_WEBHOOK_URL</code> in
+                your Vercel project settings to pre-configure this field.
                 A rich notification with the package summary will be posted to the channel.
                 <a href="https://api.slack.com/messaging/webhooks" target="_blank"
                   style={{ color:"#5BA8F5", marginLeft:5 }}>Setup guide ↗</a>
               </div>
-              <div className="share-field">
-                <label>Slack Incoming Webhook URL</label>
-                <input className="input" value={webhookUrl} onChange={e => setWebhookUrl(e.target.value)}
-                  placeholder="https://hooks.slack.com/services/…" style={{ fontSize:12 }} />
-              </div>
+              <CredentialField
+                label="Slack Incoming Webhook URL"
+                envVar={ENV_WEBHOOK}
+                value={webhookUrl}
+                onChange={setWebhookUrl}
+                placeholder="https://hooks.slack.com/services/…"
+              />
             </>
           ) : (
             <>
               <div className="info-box">
-                Provide a <strong>Slack Bot Token</strong> (xoxb-…) and the target <strong>Channel ID</strong>.
-                The XLSX file will be uploaded directly to the channel with a notification message.
+                Set <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_SLACK_BOT_TOKEN</code> and{" "}
+                <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_SLACK_CHANNEL_ID</code> in
+                Vercel project settings for zero-config file uploads.
                 <a href="https://api.slack.com/authentication/token-types#bot" target="_blank"
                   style={{ color:"#5BA8F5", marginLeft:5 }}>Token guide ↗</a>
               </div>
-              <div className="share-field">
-                <label>Slack Bot Token</label>
-                <input className="input" value={botToken} onChange={e => setBotToken(e.target.value)}
-                  placeholder="xoxb-…" style={{ fontSize:12 }} />
-              </div>
-              <div className="share-field">
-                <label>Channel ID</label>
-                <input className="input" value={channelId} onChange={e => setChannelId(e.target.value)}
-                  placeholder="C0123456789" style={{ fontSize:12 }} />
-              </div>
+              <CredentialField
+                label="Slack Bot Token"
+                envVar={ENV_BOT_TOKEN}
+                value={botToken}
+                onChange={setBotToken}
+                placeholder="xoxb-…"
+              />
+              <CredentialField
+                label="Channel ID"
+                envVar={ENV_CHANNEL_ID}
+                value={channelId}
+                onChange={setChannelId}
+                placeholder="C0123456789"
+              />
             </>
           )}
 
@@ -1847,6 +2012,7 @@ function SlackTab({ fileName, blob, subject, packages }) {
 
           <button className="btn btn-primary"
             onClick={mode === "webhook" ? handleWebhookSend : handleBotSend}
+            disabled={loading}
             style={{ width:"100%", marginTop:16, justifyContent:"center", display:"flex", alignItems:"center", gap:7 }}>
             {SLACK_ICON}
             {mode === "webhook" ? "Post Notification to Slack" : "Upload File to Slack"}
@@ -2020,6 +2186,49 @@ export default function MediSort_AI() {
   const updateStep = (idx, status, message) =>
     setSteps(prev => prev.map((s, i) => i === idx ? { ...s, status, message } : s));
 
+  /* ─────────────────────────────────────────────────────────────────────────
+     ruleBasedClassify — deterministic fallback used when the AI either
+     fails outright or collapses all tests into a single bucket.
+     Keyword rules mirror the TAXONOMY in the AI prompt so the two stay
+     in sync. Order matters: more-specific patterns are checked first.
+  ───────────────────────────────────────────────────────────────────────── */
+  const ruleBasedClassify = (tests) => {
+    const RULES = [
+      { cat: "Urine Routine Analysis",      re: /^urine\b|urobilinogen|microalbumin|amorphous|urine\s*acr|urine\s*potassium/i },
+      { cat: "Lipid Profile",               re: /cholesterol|hdl|ldl|vldl|triglyceride|apolipoprotein|lipid/i },
+      { cat: "Diabetes Profile",            re: /blood\s*sugar|fbs|hba1c|glycat|food\s*tolerance|ppbs|insulin/i },
+      { cat: "Kidney Function Tests",       re: /creatinine.*blood|blood.*creatinine|uric\s*acid|bun|blood\s*urea|bun\/|egfr/i },
+      { cat: "Thyroid Profile",             re: /tsh|triiodothyronine|thyroxine|\bt3\b|\bt4\b|thyroid/i },
+      { cat: "Liver Function Tests",        re: /bilirubin|sgot|sgpt|\balt\b|\bast\b|\balp\b|ggt|albumin.*serum|serum.*albumin|globulin|liver/i },
+      { cat: "Complete Blood Count (CBC)",  re: /haemoglobin|hemoglobin|platelet|wbc|rbc\s*count|\brdw\b|\bpdw\b|\bp-lcr\b|nucleated.*red|mch|mcv|mchc|hct|hematocrit|neutrophil|lymphocyte|monocyte|eosinophil|basophil|differential|leukocyte/i },
+      { cat: "Iron Studies",                re: /serum\s*iron|iron\s*test|tibc|transferrin|ferritin/i },
+      { cat: "Vitamins",                    re: /vitamin/i },
+      { cat: "Electrolytes & Minerals",     re: /sodium|potassium.*serum|serum.*potassium|chloride|calcium|magnesium|phosphorus|bicarbonate|electrolyte/i },
+      { cat: "Cardiac Risk Markers",        re: /hs-crp|crp|homocysteine|troponin|bnp|ldh|cpk|cardiac/i },
+      { cat: "Hormones",                    re: /cortisol|testosterone|estrogen|progesterone|\bfsh\b|\blh\b|prolactin|dhea|igf|hormone/i },
+      { cat: "Infectious Disease / Serology", re: /hbsag|hiv|vdrl|dengue|malaria|typhoid|widal|hepatitis|serology/i },
+      { cat: "Coagulation Profile",         re: /prothrombin|\bpt\b|\binr\b|aptt|fibrinogen|bleeding\s*time|clotting\s*time/i },
+    ];
+
+    const result = {};
+    for (const test of tests) {
+      let placed = false;
+      for (const { cat, re } of RULES) {
+        if (re.test(test)) {
+          if (!result[cat]) result[cat] = [];
+          result[cat].push(test);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) {
+        if (!result["Other Tests"]) result["Other Tests"] = [];
+        result["Other Tests"].push(test);
+      }
+    }
+    return result;
+  };
+
   const processFile = async () => {
     if (!rawData) return;
     setIsProcessing(true);
@@ -2074,50 +2283,115 @@ export default function MediSort_AI() {
         updateStep(2, "active", `Classifying package ${i + 1} of ${validPackages.length}…`);
         const p = validPackages[i];
 
-        const prompt = `You are a medical data classification expert.
+        // ── Authoritative category taxonomy with keyword hints ─────────────────
+        // Gemini must match every test to exactly one of these categories.
+        // The keyword lists are hints — not exhaustive — to resolve ambiguous tests.
+        const TAXONOMY = `
+ALLOWED CATEGORIES (use these exact names, in this priority order):
+1.  "Urine Routine Analysis"     — anything prefixed "Urine", urobilinogen, microalbumin, urine ACR, urine potassium, amorphous deposits
+2.  "Lipid Profile"              — cholesterol, HDL, LDL, VLDL, triglycerides, apolipoproteins, lipid ratios
+3.  "Diabetes Profile"           — blood sugar, FBS, HbA1c, glycated, food tolerance test, PPBS, insulin
+4.  "Kidney Function Tests"      — creatinine (blood), uric acid, BUN, BUN/creatinine ratio, eGFR
+5.  "Thyroid Profile"            — TSH, T3, T4, triiodothyronine, thyroxine, thyroid
+6.  "Liver Function Tests"       — bilirubin (serum/total/direct/indirect), SGOT, SGPT, ALT, AST, ALP, GGT, albumin (serum), total protein, globulin
+7.  "Complete Blood Count (CBC)" — haemoglobin, RBC count, WBC, platelet, HCT, MCV, MCH, MCHC, RDW, PDW, P-LCR, nucleated RBC, differential count, neutrophil, lymphocyte, monocyte, eosinophil, basophil
+8.  "Iron Studies"               — serum iron, TIBC, transferrin saturation, ferritin
+9.  "Vitamins"                   — vitamin B12, vitamin D, folate, folic acid, vitamin C, vitamin A
+10. "Electrolytes & Minerals"    — sodium, potassium (serum), chloride, calcium (serum), magnesium, phosphorus, bicarbonate
+11. "Cardiac Risk Markers"       — CRP, hs-CRP, homocysteine, troponin, BNP, LDH, CPK, cardiac enzymes
+12. "Hormones"                   — cortisol, testosterone, estrogen, progesterone, FSH, LH, prolactin, DHEA, IGF
+13. "Infectious Disease / Serology" — HBsAg, HIV, VDRL, dengue, malaria, typhoid, widal, hepatitis, CRP (infection context)
+14. "Coagulation Profile"        — PT, INR, APTT, fibrinogen, bleeding time, clotting time
+15. "Other Tests"                — any test that genuinely does not fit the above categories`;
 
-Classify these medical tests into clinically meaningful categories and generate a package name and display name.
+        const prompt = `You are a senior medical laboratory data classification specialist.
 
-Tests list:
+Your task: classify every test in the input list into the correct clinical category, then return a JSON object.
+
+━━━ INPUT TESTS ━━━
 ${p.tests.join("\n")}
 
-Additional info:
-- Service Location: ${p.serviceLocation}
-- Age/Gender: ${p.ageGender}
-- Price: ${p.price}
+━━━ PACKAGE METADATA ━━━
+Service Location: ${p.serviceLocation || "Not specified"}
+Age/Gender: ${p.ageGender || "Not specified"}
+Price: ${p.price || "Not specified"}
 
-Return ONLY a valid JSON object — no markdown, no explanation, no preamble:
+━━━ TAXONOMY ━━━
+${TAXONOMY}
+
+━━━ EXAMPLE (for reference — do not copy, classify the actual tests above) ━━━
+Input: ["TSH", "Serum Iron", "Urine Protein", "HbA1c", "Vitamin B12", "Haemoglobin"]
+Output categories:
+  "Thyroid Profile"            → ["TSH"]
+  "Iron Studies"               → ["Serum Iron"]
+  "Urine Routine Analysis"     → ["Urine Protein"]
+  "Diabetes Profile"           → ["HbA1c"]
+  "Vitamins"                   → ["Vitamin B12"]
+  "Complete Blood Count (CBC)" → ["Haemoglobin"]
+
+━━━ STRICT RULES ━━━
+1. EVERY test from the input MUST appear in exactly one category. Zero omissions.
+2. Use ONLY category names from the taxonomy above. Do NOT invent new names.
+3. NEVER use "General Tests", "Miscellaneous", "Others" unless a test truly fits none of the 14 named categories.
+4. Do NOT merge all tests into one category — the output MUST have multiple categories if the tests span multiple domains.
+5. Copy test names EXACTLY as given — no rewording, no capitalisation changes.
+6. Return ONLY valid JSON — no markdown fences, no explanation, no preamble.
+
+━━━ OUTPUT FORMAT ━━━
 {
-  "packageName": "Short identifier code e.g. COMP-HEALTH-PRO",
-  "displayName": "Human-readable full package title",
+  "packageName": "SHORT-CODE e.g. COMP-HEALTH-ADV",
+  "displayName": "Full human-readable package title",
   "categories": {
-    "Category Name": ["Test 1", "Test 2"]
+    "Category Name": ["Exact Test Name 1", "Exact Test Name 2"]
   }
-}
+}`;
 
-Rules:
-- Use standard category names: "Urine Routine Analysis", "Thyroid Profile", "Complete Blood Count (CBC)", "Lipid Profile", "Liver Function Tests", "Kidney Function Tests", "Diabetes Profile", "Vitamins", "Electrolytes & Minerals", "Iron Studies", "Cardiac Risk Markers", "Others"
-- Keep ALL original test names exactly as given — do not rename them
-- No duplicate tests across categories
-- Every test in the input must appear in exactly one category`;
+        // ── Classify with automatic retry if model collapses to one category ──
+        const classify = async (retryPrompt) => {
+          const raw    = await callGemini([{ role: "user", content: retryPrompt }]);
+          const parsed = extractJSON(raw);
+          return parsed;
+        };
 
         try {
-          const raw = await callClaude([{ role: "user", content: prompt }]);
-          const parsed = extractJSON(raw);   // robust extraction handles fences + leading text
+          let parsed = await classify(prompt);
+
+          // ── Validation: reject single-bucket responses and retry once ─────────
+          const catKeys = parsed?.categories ? Object.keys(parsed.categories) : [];
+          const totalTests = p.tests.length;
+          const isSingleBucket = catKeys.length === 1 && totalTests > 5;
+
+          if (isSingleBucket) {
+            console.warn(`Package ${i + 1}: single-category collapse detected ("${catKeys[0]}") — retrying with stricter prompt…`);
+            const retryPrompt = prompt + `
+
+⚠️ CRITICAL CORRECTION REQUIRED:
+Your previous response grouped ALL ${totalTests} tests into a single category ("${catKeys[0]}").
+This is WRONG. These tests belong to MULTIPLE distinct clinical categories.
+You MUST split them correctly across the taxonomy. Returning a single category is a classification failure.`;
+            parsed = await classify(retryPrompt);
+          }
+
           validPackages[i].packageName = parsed.packageName || "";
           validPackages[i].displayName = parsed.displayName || "";
-          // Validate categories is a plain object with at least one key
-          if (parsed.categories && typeof parsed.categories === "object" && Object.keys(parsed.categories).length > 0) {
+
+          if (
+            parsed.categories &&
+            typeof parsed.categories === "object" &&
+            Object.keys(parsed.categories).length > 0
+          ) {
             validPackages[i].categories = parsed.categories;
           } else {
-            validPackages[i].categories = { "General Tests": p.tests };
+            // Last-resort rule-based fallback — never dumps everything into one bucket
+            validPackages[i].categories = ruleBasedClassify(p.tests);
           }
+
         } catch (err) {
-          // Per-package fallback — never lets one failure stop the rest
           console.warn(`Package ${i + 1} classification failed:`, err.message);
           validPackages[i].packageName = "";
           validPackages[i].displayName = "";
-          validPackages[i].categories  = { "General Tests": p.tests };
+          // Rule-based fallback preserves clinical structure even without AI
+          validPackages[i].categories  = ruleBasedClassify(p.tests);
         }
 
         // Brief pause between API calls to respect rate limits
