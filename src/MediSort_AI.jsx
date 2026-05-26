@@ -13,7 +13,7 @@ import {
 // ── Gemini configuration ────────────────────────────────────────────────────
 // Model: gemini-2.0-flash  (fast, cost-efficient, supports system instructions)
 // API key is read from VITE_GEMINI_API_KEY in your .env file.
-const GEMINI_MODEL   = "gemini-2.0-flash";
+const GEMINI_MODEL   = "gemini-2.5-flash-lite";
 const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
 const GEMINI_API_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
@@ -48,34 +48,54 @@ async function callGemini(messages, systemPrompt = "", maxTokens = 4096, extraCo
     },
   };
 
-  const res = await fetch(GEMINI_API_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  // Retry with exponential backoff on 429 (rate limit) and 503 (overload).
+  // Delays: 2s → 4s → 8s (3 retries max).
+  const MAX_RETRIES = 3;
+  let attempt = 0;
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error("Gemini API error:", errText);
-    throw new Error(`HTTP ${res.status}`);
+  while (true) {
+    const res = await fetch(GEMINI_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    // On rate-limit or server overload, wait and retry
+    if ((res.status === 429 || res.status === 503) && attempt < MAX_RETRIES) {
+      // Honour Retry-After header if present, otherwise use exponential backoff
+      const retryAfter = res.headers.get("Retry-After");
+      const waitMs = retryAfter
+        ? parseFloat(retryAfter) * 1000
+        : Math.pow(2, attempt + 1) * 1000;  // 2s, 4s, 8s
+      console.warn(`Gemini ${res.status} — retrying in ${waitMs / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await new Promise(r => setTimeout(r, waitMs));
+      attempt++;
+      continue;
+    }
+
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error("Gemini API error:", errText);
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+
+    if (data.error) {
+      throw new Error(data.error.message || "Gemini API error");
+    }
+
+    // Surface safety-block reason so callers can surface it to the user
+    const blockReason = data.promptFeedback?.blockReason;
+    if (blockReason) throw new Error(`Request blocked by Gemini: ${blockReason}`);
+
+    // Collect all text parts from the first candidate (mirrors callClaude's join)
+    return (
+      data.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || "")
+        .join("") || ""
+    );
   }
-
-  const data = await res.json();
-
-  if (data.error) {
-    throw new Error(data.error.message || "Gemini API error");
-  }
-
-  // Surface safety-block reason so callers can surface it to the user
-  const blockReason = data.promptFeedback?.blockReason;
-  if (blockReason) throw new Error(`Request blocked by Gemini: ${blockReason}`);
-
-  // Collect all text parts from the first candidate (mirrors callClaude's join)
-  return (
-    data.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text || "")
-      .join("") || ""
-  );
 }
 
 /* Robust JSON extractor — handles markdown fences, leading/trailing prose */
@@ -1276,13 +1296,51 @@ Always format your responses using clean markdown:
 Context: ${dataCtx}`;
 
     try {
-      const reply = await callGemini(
-        [...messages, userMsg].map(m => ({ role:m.role==="user"?"user":"assistant", content:m.content })),
-        sys
-      );
+      // Gemini requires the conversation to start with a "user" turn AND
+      // turns must strictly alternate user → model → user → model …
+      // Strategy:
+      //   1. Build the full history including the new userMsg.
+      //   2. Drop any leading assistant messages.
+      //   3. Enforce strict alternation: if two consecutive messages share the
+      //      same role, collapse them by concatenating their content so the
+      //      array always alternates user/assistant before we send it.
+      const allMsgs = [...messages, userMsg].map(m => ({
+        role: m.role === "user" ? "user" : "assistant",
+        content: m.content,
+      }));
+
+      // Drop leading assistant messages
+      const firstUserIdx = allMsgs.findIndex(m => m.role === "user");
+      const trimmed = firstUserIdx > 0 ? allMsgs.slice(firstUserIdx) : allMsgs;
+
+      // Enforce strict alternation by merging consecutive same-role messages
+      const geminiMsgs = trimmed.reduce((acc, msg) => {
+        if (acc.length > 0 && acc[acc.length - 1].role === msg.role) {
+          // Merge into previous turn
+          acc[acc.length - 1] = {
+            role: msg.role,
+            content: acc[acc.length - 1].content + "\n\n" + msg.content,
+          };
+        } else {
+          acc.push({ ...msg });
+        }
+        return acc;
+      }, []);
+
+      // Final safety check: must end with a user message
+      if (geminiMsgs.length === 0 || geminiMsgs[geminiMsgs.length - 1].role !== "user") {
+        geminiMsgs.push({ role: "user", content: userMsg.content });
+      }
+
+      const reply = await callGemini(geminiMsgs, sys);
       setMessages(prev => [...prev, { role:"assistant", content:reply }]);
-    } catch {
-      setMessages(prev => [...prev, { role:"assistant", content:"Sorry, I hit an error. Please try again." }]);
+    } catch (err) {
+      console.error("ChatWidget callGemini error:", err);
+      const isRateLimit = err.message?.includes("429");
+      const errMsg = isRateLimit
+        ? "I'm getting rate-limited by the AI service right now. Please wait a few seconds and try again."
+        : `Sorry, I hit an error: ${err.message || "Unknown error"}. Please try again.`;
+      setMessages(prev => [...prev, { role:"assistant", content: errMsg }]);
     } finally { setLoading(false); }
   };
 
@@ -1656,8 +1714,7 @@ function GmailTab({ fileName, blob, subject }) {
           : <AlertTriangle size={13} color="#F08070" />}
         <span style={{ fontSize:12, color: isConfigured ? "#7ABEDC" : "#F08070", lineHeight:1.4 }}>
           {isConfigured
-            ? <>OAuth configured via <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_GOOGLE_CLIENT_ID</code>
-                &nbsp;— sign-in popup appears only on first send per session.</>
+            ? <>OAuth configured</>
             : <>Set <code style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:11 }}>VITE_GOOGLE_CLIENT_ID</code> in your Vercel project settings to enable Gmail drafts.</>}
         </span>
       </div>
@@ -2046,16 +2103,16 @@ function TopBar({ user, onLogout, processedPackages, onDownload, onShare }) {
       <div style={{ display:"flex", alignItems:"center", gap:10 }}>
         {processedPackages && (
           <>
-            {/* Share button — triggers share menu / integrations */}
+            {/* Share button — triggers share menu / integrations 
             <button className="btn btn-ghost" onClick={onShare}
               style={{ padding:"7px 14px", fontSize:13, display:"flex", alignItems:"center", gap:6 }}>
               <Share2 size={13} /> Share
-            </button>
-            {/* Download button — exclusively triggers .xlsx download */}
+            </button> */}
+            {/* Download button — exclusively triggers .xlsx download 
             <button className="btn btn-primary" onClick={onDownload}
               style={{ padding:"7px 14px", fontSize:13, display:"flex", alignItems:"center", gap:6 }}>
               <Download size={13} /> Download .xlsx
-            </button>
+            </button> */}
           </>
         )}
         <div style={{ display:"flex", alignItems:"center", gap:8, padding:"6px 12px",
