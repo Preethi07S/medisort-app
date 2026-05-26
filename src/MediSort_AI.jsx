@@ -463,207 +463,134 @@ function LoginScreen({ onLogin }) {
   // Same value is reused by the Gmail share tab — no second credential needed.
   const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
 
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+  // "gisReady" drives renderButton — it is set to true only AFTER both
+  // the GIS script has loaded AND window.google.accounts.id.initialize() has
+  // returned successfully.  A separate useEffect watches this flag and calls
+  // renderButton once the ref div is guaranteed to be in the DOM.
+  const [gisReady,  setGisReady]  = useState(false);
+  const [btnLoading, setBtnLoading] = useState(true);   // shows inline spinner
+  const [error,     setError]     = useState("");
 
-  const googleBtnRef = useRef(null);
-  const gisLoaded = useRef(false);
-  const buttonRendered = useRef(false);
+  const googleBtnRef  = useRef(null);
+  // Tracks whether the GIS <script> tag has already been injected so we never
+  // append it twice (React Strict Mode double-invokes effects in dev).
+  const scriptInjected = useRef(false);
+
   /* ─────────────────────────────────────────────
      Decode Google JWT Payload
   ───────────────────────────────────────────── */
   function decodeGoogleJwt(token) {
     try {
       const payload = token.split(".")[1];
-
-      const b64 = payload
-        .replace(/-/g, "+")
-        .replace(/_/g, "/");
-
+      const b64  = payload.replace(/-/g, "+").replace(/_/g, "/");
       const json = decodeURIComponent(
-        atob(b64)
-          .split("")
-          .map(
-            c =>
-              "%" +
-              c.charCodeAt(0)
-                .toString(16)
-                .padStart(2, "0")
-          )
-          .join("")
+        atob(b64).split("").map(c => "%" + c.charCodeAt(0).toString(16).padStart(2, "0")).join("")
       );
-
       return JSON.parse(json);
-
     } catch {
       return null;
     }
   }
 
   /* ─────────────────────────────────────────────
-     Load Google Identity Services SDK
-  ───────────────────────────────────────────── */
-  const loadGIS = () =>
-    new Promise((resolve, reject) => {
-
-      // Already loaded
-      if (window.google?.accounts?.id) {
-        resolve();
-        return;
-      }
-
-      // Prevent duplicate loads
-      if (gisLoaded.current) {
-        resolve();
-        return;
-      }
-
-      gisLoaded.current = true;
-
-      const script = document.createElement("script");
-
-      script.src =
-        "https://accounts.google.com/gsi/client";
-
-      script.async = true;
-      script.defer = true;
-
-      script.onload = resolve;
-
-      script.onerror = () =>
-        reject(
-          new Error(
-            "Failed to load Google Sign-In"
-          )
-        );
-
-      document.head.appendChild(script);
-    });
-
-  /* ─────────────────────────────────────────────
-     Initialize Google OAuth
-  ───────────────────────────────────────────── */
-  const initGoogle = async () => {
-
-    // Guard: catch missing env var before hitting Google — gives a clear error
-    // instead of the cryptic "Error 400: Missing required parameter: client_id".
-    if (!clientId) {
-      setError(
-        "VITE_GOOGLE_CLIENT_ID is not configured. " +
-        "Add it to your .env file (local) or Vercel project → Settings → " +
-        "Environment Variables (production), then rebuild / redeploy."
-      );
-      return;
-    }
-
-    setLoading(true);
-    setError("");
-
-    try {
-
-      await loadGIS();
-
-      window.google.accounts.id.initialize({
-        client_id: clientId,
-
-        callback: handleCredential,
-
-        auto_select: false,
-
-        cancel_on_tap_outside: true,
-
-        ux_mode: "popup",
-      });
-
-      // Render Google Button
-      if (
-  googleBtnRef.current &&
-  !buttonRendered.current
-) {
-
-  buttonRendered.current = true;
-
-  window.google.accounts.id.renderButton(
-    googleBtnRef.current,
-    {
-      theme: "filled_blue",
-      size: "large",
-      shape: "rectangular",
-      text: "signin_with",
-      width: 340,
-      logo_alignment: "left",
-    }
-  );
-}
-
-    } catch (err) {
-
-      console.error(err);
-
-      setError(
-        err.message ||
-        "Google OAuth initialization failed."
-      );
-
-    } finally {
-
-      setLoading(false);
-    }
-  };
-
-  /* ─────────────────────────────────────────────
      Handle Successful Login
   ───────────────────────────────────────────── */
   const handleCredential = (response) => {
-
-    console.log(
-      "Google OAuth Response:",
-      response
-    );
-
-    const payload =
-      decodeGoogleJwt(response.credential);
-
-    if (!payload) {
-
-      setError(
-        "Failed to decode Google credential."
-      );
-
-      return;
-    }
-
-    console.log(
-      "Google User:",
-      payload
-    );
-
-    // ✅ PRESERVING YOUR EXISTING LOGIN FLOW
+    const payload = decodeGoogleJwt(response.credential);
+    if (!payload) { setError("Failed to decode Google credential."); return; }
     onLogin({
-      name:
-        payload.name ||
-        payload.email,
-
-      email:
-        payload.email || "",
-
-      picture:
-        payload.picture || "",
-
+      name:     payload.name    || payload.email,
+      email:    payload.email   || "",
+      picture:  payload.picture || "",
       provider: "Google",
     });
   };
 
   /* ─────────────────────────────────────────────
-     Auto Initialize OAuth On Component Mount
+     Step 1 — Load GIS script + initialize()
+     Runs once on mount.  Does NOT call renderButton
+     here — that happens in the effect below once
+     gisReady flips to true and the ref is in DOM.
   ───────────────────────────────────────────── */
   useEffect(() => {
+    if (!clientId) {
+      setError(
+        "VITE_GOOGLE_CLIENT_ID is not configured. " +
+        "Add it to your .env file (local) or Vercel → Settings → Environment Variables, then redeploy."
+      );
+      setBtnLoading(false);
+      return;
+    }
 
-  if (!buttonRendered.current) {
-    initGoogle();
-  }
+    const initGIS = () => {
+      // GIS is ready — initialize and flip the flag.
+      // renderButton is deliberately NOT called here; the DOM ref may not
+      // yet be pointing at a mounted element at this moment.
+      try {
+        window.google.accounts.id.initialize({
+          client_id:            clientId,
+          callback:             handleCredential,
+          auto_select:          false,
+          cancel_on_tap_outside: true,
+          ux_mode:              "popup",
+        });
+        setGisReady(true);   // triggers the render effect below
+      } catch (err) {
+        console.error("GIS initialize failed:", err);
+        setError("Google Sign-In initialization failed. Please refresh.");
+        setBtnLoading(false);
+      }
+    };
 
-}, []);
+    // If GIS already loaded from a previous render (HMR / Strict Mode)
+    if (window.google?.accounts?.id) {
+      initGIS();
+      return;
+    }
+
+    // Inject the script only once even if the effect fires twice (Strict Mode)
+    if (scriptInjected.current) return;
+    scriptInjected.current = true;
+
+    const script    = document.createElement("script");
+    script.src      = "https://accounts.google.com/gsi/client";
+    script.async    = true;
+    script.defer    = true;
+    script.onload   = initGIS;
+    script.onerror  = () => {
+      setError("Failed to load Google Sign-In SDK. Check your network and refresh.");
+      setBtnLoading(false);
+    };
+    document.head.appendChild(script);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId]);
+
+  /* ─────────────────────────────────────────────
+     Step 2 — Render the Google button
+     Runs whenever gisReady becomes true.
+     By this point the JSX has committed the ref
+     div to the DOM so googleBtnRef.current is
+     guaranteed to be non-null.
+  ───────────────────────────────────────────── */
+  useEffect(() => {
+    if (!gisReady || !googleBtnRef.current) return;
+
+    // Clear any previous button (e.g. HMR re-render) before re-rendering
+    googleBtnRef.current.innerHTML = "";
+
+    window.google.accounts.id.renderButton(
+      googleBtnRef.current,
+      {
+        theme:         "filled_blue",
+        size:          "large",
+        shape:         "rectangular",
+        text:          "signin_with",
+        width:         340,
+        logo_alignment:"left",
+      }
+    );
+    setBtnLoading(false);
+  }, [gisReady]);
   /* ─────────────────────────────────────────────
      UI
   ───────────────────────────────────────────── */
@@ -790,42 +717,43 @@ function LoginScreen({ onLogin }) {
             </div>
           )}
 
+          {/* ── Google button container ────────────────────────────────────
+               The ref div is ALWAYS in the DOM so renderButton() can target
+               it immediately after gisReady flips — no conditional unmounting.
+               The inline spinner overlays while the GIS script is loading;
+               it disappears once setBtnLoading(false) fires.
+          ─────────────────────────────────────────────────────────────────── */}
           <div
             style={{
-              display: "flex",
+              position:       "relative",
+              display:        "flex",
               justifyContent: "center",
-              minHeight: 44,
-              marginBottom: 16,
+              alignItems:     "center",
+              minHeight:      44,
+              marginBottom:   16,
             }}
           >
-
-            {loading ? (
-
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  color: "#5BA8F5",
-                  fontSize: 13,
-                }}
-              >
-
-                <Loader2
-                  size={16}
-                  className="spin"
-                />
-
-                Loading Google Sign-In...
-
+            {/* Spinner — shown while GIS script is still loading */}
+            {btnLoading && (
+              <div style={{
+                position:   "absolute",
+                display:    "flex",
+                alignItems: "center",
+                gap:        8,
+                color:      "#5BA8F5",
+                fontSize:   13,
+                pointerEvents: "none",
+              }}>
+                <Loader2 size={16} className="spin" />
+                Loading Google Sign-In…
               </div>
-
-            ) : (
-
-              <div ref={googleBtnRef} />
-
             )}
 
+            {/* Button target — always mounted so renderButton always finds the ref */}
+            <div
+              ref={googleBtnRef}
+              style={{ visibility: btnLoading ? "hidden" : "visible" }}
+            />
           </div>
 
           {/* Error */}
@@ -989,7 +917,7 @@ function UploadView({ file, rawData, onDrop, onFileSelect, onProcess, error, isP
               <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
                 <thead>
                   <tr>
-                    <th style={{ padding:"8px 12px", textAlign:"left", color:"#4A6070", fontWeight:600, borderBottom:"1px solid rgba(255,255,255,.07)" }}>Row</th>
+                    {/*<th style={{ padding:"8px 12px", textAlign:"left", color:"#4A6070", fontWeight:600, borderBottom:"1px solid rgba(255,255,255,.07)" }}>Row</th>*/}
                     {Array.from({ length: numCols }, (_, i) => (
                       <th key={i} style={{ padding:"8px 12px", textAlign:"left", color:"#00D4B4", fontWeight:600, borderBottom:"1px solid rgba(255,255,255,.07)" }}>
                         Package {i+1}
@@ -1000,7 +928,7 @@ function UploadView({ file, rawData, onDrop, onFileSelect, onProcess, error, isP
                 <tbody>
                   {["Location","Age/Gender","Price"].map((label, ri) => (
                     <tr key={label}>
-                      <td style={{ padding:"6px 12px", color:"#4A6070", fontFamily:"'IBM Plex Mono',monospace" }}>{label}</td>
+                      {/*<td style={{ padding:"6px 12px", color:"#4A6070", fontFamily:"'IBM Plex Mono',monospace" }}>{label}</td>*/}
                       {Array.from({ length: numCols }, (_, ci) => (
                         <td key={ci} style={{ padding:"6px 12px", color:"#B0C4D8", maxWidth:180, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
                           {String(rawData[ri]?.[ci] || "—")}
