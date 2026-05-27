@@ -8,6 +8,15 @@ import {
   Share2, Mail, ExternalLink, Copy, Maximize2, Minimize2, Minus
 } from "lucide-react";
 
+import ReactGA from "react-ga4";
+
+ReactGA.initialize("G-R9TKNL7SDK");
+
+ReactGA.send({
+  hitType: "pageview",
+  page: window.location.pathname,
+});
+
 /* ─────────────────────────── HELPERS ─────────────────────────── */
 
 // ── Gemini configuration ────────────────────────────────────────────────────
